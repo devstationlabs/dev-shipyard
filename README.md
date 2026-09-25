@@ -1,0 +1,253 @@
+# DevStation
+
+The terminal agent: **[docs/CLI.md](docs/CLI.md)** — install, use, debug, uninstall.
+
+**The AI Developer OS for QIE and Web3.** Describe it. Build it. Ship it.
+
+DevStation is a complete, onchain developer console for **QIE**, with **BOT Chain** supported alongside it. It brings the everyday work of a smart-contract developer into one place: write and compile Solidity in the browser, deploy audited templates, generate and deploy contracts with an AI agent, decode any transaction, browse the chain with a built-in block explorer, and label contracts onchain. Everything runs against live networks, and the records that matter (your deployments and the contract label registry) live onchain, per chain, not in a private database.
+
+- **Live app:** <https://devstation.online>
+- **Networks:** QIE Testnet and **QIE Mainnet (default)**, plus BOT Chain Testnet and Mainnet. Full chain IDs, RPCs, explorers, and registry addresses are in **[DEPLOYMENT.md](./DEPLOYMENT.md)**.
+- **Explorer coverage:** both chains are Blockscout-backed, so wallet, deploy, registry, verification and the built-in Explorer dashboard all work natively on each: see [DEPLOYMENT.md](./DEPLOYMENT.md#explorer-availability-per-chain).
+
+> Originally scaffolded on a TanStack Start template. Now fully wired to the chain: real RPC reads, real deployments, real onchain registries, no mock data on the critical paths.
+
+---
+
+## Table of contents
+
+- [What's inside](#whats-inside)
+- [Feature tour](#feature-tour)
+  - [LaunchKit](#launchkit)
+  - [Routebook](#routebook)
+  - [Explorer](#explorer)
+  - [AI assistant](#ai-assistant)
+  - [Wallets](#wallets)
+- [Onchain registries](#onchain-registries)
+- [Tech stack](#tech-stack)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [How it works](#how-it-works)
+- [Project structure](#project-structure)
+- [Scripts](#scripts)
+- [Known limitations](#known-limitations)
+- [License](#license)
+
+For hosting steps, the full per-chain network config, and deployed registry
+addresses, see **[DEPLOYMENT.md](./DEPLOYMENT.md)**.
+
+---
+
+## What's inside
+
+| Area                   | What it does                                                                                                                                                      |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **LaunchKit**          | Deploy audited contract templates, write and compile Solidity in the browser, and generate, audit, and deploy contracts with an AI agent, on any supported chain. |
+| **Routebook**          | Decode any transaction, on any supported chain, into a readable call tree with internal calls, events, and onchain contract labels.                               |
+| **Explorer**           | A native, Etherscan-style block explorer for blocks, transactions, addresses, tokens, and holders, across every supported chain and network.                      |
+| **Onchain registries** | A ProjectRegistry records every deployment, and a ContractLabelRegistry gives contracts human-readable names, per chain.                                          |
+| **Docs**               | A built-in, multi-page documentation section at `/docs`.                                                                                                          |
+
+---
+
+## Feature tour
+
+### LaunchKit
+
+- **Marketplace** (`/launchkit/marketplace`): builders sell contract templates, whole apps, agent skills and UI kits, priced in QIE or QUSDC, one-time or per deploy, with tips and paid featured placement. Creators keep 95% and withdraw from the Earnings page. Terms and access live in `DevStationMarketplace` on QIE Mainnet (`0xeeae4de6198cbcc837240115e86554c6968ba51d`, source-verified); paid files are held by the runner and released only to wallets the contract says have paid. The built-in templates (ERC20, ERC721, Soulbound NFT, MultiSig, Timelock, Vesting, Staking, Payment Splitter and more) are listed there as official, free listings with their real onchain deploy counts. `/launchkit/templates` redirects to it.
+- **Contract Editor** (`/launchkit/editor`): a Monaco editor with Solidity highlighting, a file workspace persisted to `localStorage`, a colored compiler terminal with an interactive command prompt, and **in-browser compilation** via a `solc` Web Worker (no backend). Picks any solc 0.7 to 0.8.26 and resolves external imports (for example OpenZeppelin) from a CDN.
+- **Code with AI** (`/launchkit/ai`): two modes. In **Chat**, the assistant writes secure, production-grade Solidity and audits contracts you paste, graded by severity; generated code blocks open straight in the Contract Editor. In **Agent** mode it goes autonomous: describe a contract, and it generates the source, compiles it in the browser, fixes its own compiler errors (up to five attempts), then deploys with your connected wallet, showing a constructor-argument form to review before you sign. See [AI assistant](#ai-assistant).
+- **Deploy** (`/launchkit/deploy`): a guided flow generated from a template's constructor. DevStation validates and encodes the arguments, compiles in a browser worker, sends the creation transaction through your wallet, and records the deployment onchain. The success screen links straight into Routebook and the DevStation explorer. On **QIE mainnet and BOT Chain mainnet**, an optional "Gas-free deploy" checkbox tops your own connected wallet up with just enough native gas token to cover the deploy, your wallet still signs and sends everything itself, so it's always the real deployer of record, see [DEPLOYMENT.md](./DEPLOYMENT.md#sponsored-deploys-qie-mainnet--bot-chain-mainnet).
+- **Projects** (`/launchkit/projects`): a per-wallet history of everything you have deployed through DevStation, read from the onchain ProjectRegistry and merged with local history. Scoped to the connected wallet.
+
+### Routebook
+
+- **Transaction inspector** (`/routebook`): paste any transaction hash from any supported chain and it decodes the call into a tree of internal calls, decoded arguments, ERC-20 transfers, approvals (with risk flags), events, and a human-readable revert reason on failure.
+- **Label Registry** (`/routebook/labels`): human-readable names for contracts, stored onchain in the ContractLabelRegistry. Deploys through DevStation are auto-labeled (pre-approved); community submissions await approval.
+
+### Explorer
+
+A native block explorer scoped to the network in the URL so a link always names its chain: `/explorer/mainnet`, `/explorer/testnet`, `/explorer/bot-mainnet`, `/explorer/bot-testnet` (the bare `/explorer` redirects to your selected network). Each chain reads its own Blockscout v2 API directly.
+
+- **Dashboard:** native token price, market cap, average block time, total blocks and transactions, gas price, network utilization, plus live latest-blocks and latest-transactions feeds and a universal search (address, transaction hash, or block number).
+- **Transaction page:** status, block and confirmations, timestamp, from and to, token transfers, value, fee, gas price, gas usage, EIP-1559 fees, nonce, event logs, and decoded or raw input data.
+- **Block page:** height with prev/next, miner, reward, gas used and limit, base fee, burnt fees, size, hashes, and the block's transactions.
+- **Address page:** balance and fiat value, counters, creator, and tabs for Transactions, Token Transfers, Tokens held, Internal Txns, Logs, and (for contracts) verified Contract source.
+- **Token page:** supply, holders, transfers, decimals, with ranked holders and ownership percentages.
+
+A prominent Testnet/Mainnet badge in the header makes the active chain unmistakable, and a network dropdown switches between any chain + network combination. Every in-app explorer reference points to this built-in explorer.
+
+### AI assistant
+
+The Solidity assistant works in two modes, resolved from Settings:
+
+- **Server proxy** (`/api/ai`): the provider key stays server-side and never reaches the browser. Preferred for shared deployments.
+- **Direct, bring-your-own-key:** you paste a key in the UI; it is stored only in your browser.
+
+**OpenRouter is the default**, and for most people the only one worth configuring: a single OpenRouter key reaches all 15 models in the picker, so there's no per-vendor account to manage. The picker is grouped by vendor: Anthropic and OpenAI first, then DeepSeek, then Google/xAI/Qwen.
+
+| Provider          | Format            | Models                                                                     |
+| ----------------- | ----------------- | -------------------------------------------------------------------------- |
+| **OpenRouter** ⭐ | OpenAI-compatible | 15 models across Anthropic, OpenAI, DeepSeek, Google, xAI and Qwen.        |
+| OpenAI direct     | OpenAI            | GPT-5.6 (Sol/Terra/Luna), GPT-5.5, GPT-5.4 Mini, with your OpenAI key.     |
+| Claude direct     | Anthropic native  | Claude Opus 5, Sonnet 5, Fable 5, Opus 4.8, Haiku 4.5: your Anthropic key. |
+| FreeModel         | OpenAI-compatible | FreeModel's GPT-5.x line.                                                  |
+
+### Wallets
+
+- **MetaMask and other injected wallets** via EIP-6963 discovery, no SDK required, on any supported chain.
+- **In-app generated wallet:** a self-custody dev wallet whose mnemonic is **password-encrypted** (AES-GCM + PBKDF2, Web Crypto) and stored only in your browser.
+- Connections survive page refreshes and are cleared only on disconnect, browser-data clear, or closing the browser. The selected network (not the wallet's current chain) drives reads everywhere; write flows prompt you to switch when the two differ.
+- A "get [token] for gas" link surfaces when the native balance is low, pointing at that chain's own DEX/faucet where one is configured.
+
+---
+
+## Onchain registries
+
+Two dependency-free Solidity contracts back the app: **ProjectRegistry** records every deployment against the deploying wallet and keeps a global `totalDeployments` counter (powering the per-wallet Projects page and the Overview's ecosystem stats), and **ContractLabelRegistry** stores human-readable contract labels with a source (auto, community, or verified) and the submitter.
+
+Each chain is a **separate deployment** with its own addresses: only QIE is currently wired in; the full address table (and how to deploy to the rest) is in **[DEPLOYMENT.md](./DEPLOYMENT.md#registry-contract-addresses)**.
+
+Registry writes use an explicit gas limit on chains whose `eth_estimateGas` under-reports what a storage-writing call needs (QIE's, for example, can return roughly 24k for a call that actually uses about 275k, which would otherwise run the write out of gas). This costs a negligible fraction of a token at those chains' gas prices.
+
+---
+
+## Tech stack
+
+| Layer           | Choice                                                          |
+| --------------- | --------------------------------------------------------------- |
+| Framework       | TanStack Start + TanStack Router (SSR, file-based routing)      |
+| UI              | React 19, Tailwind v4, Radix primitives                         |
+| Web3            | viem + wagmi 2.x (injected/MetaMask + in-app burner connectors) |
+| Editor          | Monaco (`@monaco-editor/react`) + browser `solc` Web Worker     |
+| State / data    | Zustand, TanStack Query, `localStorage` persistence             |
+| Explorer data   | Blockscout v2 API, via chain-scoped server proxies              |
+| Build / runtime | Vite 7, Bun, Nitro (host-aware deploy presets)                  |
+
+---
+
+## Quick start
+
+Requires [Bun](https://bun.sh).
+
+```bash
+bun install
+cp .env.example .env.local   # optional: sensible defaults are built in
+bun run dev                  # http://localhost:8080
+```
+
+Everything works with zero config against QIE Testnet. Set env vars to point at deployed registries on other chains, enable mainnet onchain features, or configure AI: the full per-chain network config and registry addresses live in **[DEPLOYMENT.md](./DEPLOYMENT.md)**, along with hosting steps for Vercel/Netlify.
+
+```bash
+bun run build      # production build (host-aware preset: see DEPLOYMENT.md)
+bun run lint
+bun run format
+```
+
+---
+
+## Configuration
+
+All client-readable vars use the **`VITE_`** prefix. Vite inlines them into the browser bundle at **build time**, so on a hosted deploy you set them in the host dashboard and **rebuild** (changing them at runtime has no effect). Copy `.env.example` to `.env.local` for local dev. **`.env.local` is gitignored; never commit it.**
+
+Per-chain network endpoints and registry contract addresses are covered in **[DEPLOYMENT.md](./DEPLOYMENT.md#network-configuration)**: this section only covers the app-level config that isn't chain-specific.
+
+### AI assistant (optional)
+
+The AI provider, model, and key are chosen in the app's Settings and stored in the browser, so no env var is required for bring-your-own-key use. For the server-proxy mode, configure a server-side key and set:
+
+| Variable                               | Purpose                                                                                                                                  |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `VITE_AI_PROXY`                        | `"true"` to route AI requests through the `/api/ai` server proxy                                                                         |
+| `OPENROUTER_API_KEY`                   | **The recommended one.** A single OpenRouter key serves every model in the picker (no `VITE_` prefix, so it never ships to the browser). |
+| `OPENAI_MODEL`                         | Optional default model, e.g. `anthropic/claude-sonnet-5`, any OpenRouter model id.                                                       |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | Alternatives, if you'd rather the proxy talk to one vendor directly.                                                                     |
+
+### QIE ecosystem (optional)
+
+| Variable             | Purpose                                                                                     |
+| -------------------- | ------------------------------------------------------------------------------------------- |
+| `VITE_QUSDC_ADDRESS` | QUSDC (QIE stablecoin) token address. When set, the wallet shows a read-only QUSDC balance. |
+
+### Server-only
+
+| Variable                  | Purpose                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `PRIVATE_KEY`             | Used **only** by `scripts/deploy.ts` to deploy the registry contracts from your machine. Lives in `.env.local`. **Never** add it to a host: the running app has no use for it.                                                                                                                                                                                                       |
+| `SPONSOR_PRIVATE_KEY`     | Optional. A live, funded QIE mainnet wallet the running app tops visitors' own wallets up from (not a relayer, see [DEPLOYMENT.md](./DEPLOYMENT.md#sponsored-deploys-qie-mainnet--bot-chain-mainnet)). Unlike `PRIVATE_KEY` above, this one _is_ meant to be set on a host, but only if you understand the abuse model, it's closer to an open token faucet than a scoped gas payer. |
+| `SPONSOR_PRIVATE_KEY_BOT` | Optional. Same as `SPONSOR_PRIVATE_KEY` above, but a separate live wallet funded with BOT for BOT Chain mainnet.                                                                                                                                                                                                                                                                     |
+
+Hosting-preset overrides (`NITRO_PRESET`, etc.) are covered in **[DEPLOYMENT.md](./DEPLOYMENT.md#hosting)**.
+
+---
+
+## How it works
+
+- **Onchain by default.** Deployments are recorded in the ProjectRegistry and contract names live in the ContractLabelRegistry, so the data is auditable and portable rather than locked in a private database. The Projects page reads `getDeployments(yourWallet)`; the Overview reads the global counter and derives unique deployers from the registry's transaction history.
+- **Compilation in the browser.** Solidity is compiled by a real `solc` build loaded in a Web Worker. There is no server compile step and nothing to install.
+- **Explorer via a server proxy.** Each chain's Explorer data (Blockscout) is fetched through a chain-scoped server function. Fetching server-side avoids browser CORS limits and keeps the explorer working under SSR. The proxy validates the request path against the known API namespace, so it cannot be used to fetch arbitrary URLs.
+- **SSR everywhere.** Routes are server-rendered, so deep links and refreshes resolve correctly through the SSR server function.
+
+---
+
+## Project structure
+
+```
+contracts/              ProjectRegistry.sol, ContractLabelRegistry.sol (+ out/ artifacts)
+scripts/                compile.ts (solc), deploy.ts (viem, per-network)
+src/
+  routes/               file-based routes (TanStack). __root.tsx is the app shell.
+    explorer.$network.* network-scoped block explorer (dashboard, tx, block, address, token, lists)
+    launchkit.*         templates, editor, AI, deploy, projects
+    routebook.*         transaction inspector + label registry
+    docs.*              multi-page documentation
+  components/
+    explorer/           explorer UI, lists, search, formatters
+    editor/             Monaco editor, terminal, deploy panel, contract interactor
+    ai/                 chat + autonomous agent surfaces
+    deploy/             post-deploy verification + actions
+    web3/ layout/ shared/ docs/  wallet, app shell, primitives, docs primitives
+  lib/
+    chains.ts           per-chain viem chains (QIE, BOT Chain) + DEX URLs
+    contracts.ts        per-chain registry addresses + write gas limit
+    explorer/           network slug mapping, formatters, Blockscout types
+    ai-settings.ts ai.ts ai-agent.ts  AI providers, endpoint resolution, streaming client, agent protocol
+    burner/             in-app encrypted wallet (vault, connector, store)
+    compiler*.ts        browser solc Web Worker + interface
+    api/                server functions: network status, ecosystem stats, explorer proxy
+                        (explorer.functions.ts for Blockscout, routescan.functions.ts for
+                        verify (Blockscout), ai
+    abis/               generated registry ABIs + bytecode
+  hooks/                useProjectRegistry, useContractLabels, useExplorer, useTemplateDeploys, useCodeAgent, ...
+vercel.json             Vercel SSR config: see DEPLOYMENT.md
+netlify.toml            Netlify SSR config: see DEPLOYMENT.md
+public/_redirects       Netlify SSR catch-all
+```
+
+---
+
+## Scripts
+
+| Command                                           | Description                                                                                    |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `bun run dev`                                     | Dev server (http://localhost:8080)                                                             |
+| `bun run build`                                   | Production build (host-aware preset)                                                           |
+| `bun run preview`                                 | Preview the production build                                                                   |
+| `bun run lint` / `bun run format`                 | ESLint / Prettier                                                                              |
+| `bun run test`                                    | Unit tests (`bun test`) for pure logic: arg parsing, static analysis, diffing, revert decoding |
+| `bun run contracts:compile`                       | Compile registries to ABIs + artifacts                                                         |
+| `bun run contracts:deploy [mainnet]`              | Deploy registries to QIE (testnet by default)                                                  |
+| `bun run contracts:deploy bot [testnet\|mainnet]` | Deploy registries to BOT Chain (testnet by default)                                            |
+
+---
+
+## Known limitations
+
+- **Contract verification** is implemented on every active chain, verifying through each chain's own Blockscout explorer. A verifier service may not always confirm a submission immediately; when that happens the contract still works and is fully usable, and the verification request completes once the service accepts it.
+- QIE's `eth_estimateGas` is unreliable for storage-writing calls; DevStation pins explicit gas limits on registry writes to work around it.
+
+---
+
+## License
+
+DevStation is released under the [MIT License](./LICENSE).

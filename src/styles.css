@@ -1,0 +1,331 @@
+@import "tailwindcss" source(none);
+@source "../src";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * DevStation Design System
+ * Terminal black + amber accents + QIE teal.
+ * All tokens are semantic: use bg-background, text-accent, etc.
+ */
+
+@theme inline {
+  --radius-sm: 2px;
+  --radius-md: 4px;
+  --radius-lg: 4px;
+  --radius-xl: 6px;
+  --radius-2xl: 8px;
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Space Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-hover: var(--primary-hover);
+
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-meta: var(--meta);
+
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-destructive: var(--danger);
+  --color-destructive-foreground: var(--primary-foreground);
+  --color-info: var(--info);
+
+  --color-code: var(--code);
+  --color-code-string: var(--code-string);
+  --color-code-number: var(--code-number);
+  --color-code-comment: var(--code-comment);
+
+  --color-cat-token: var(--cat-token);
+  --color-cat-defi: var(--cat-defi);
+  --color-cat-gov: var(--cat-gov);
+  --color-cat-util: var(--cat-util);
+  --color-cat-nft: var(--cat-nft);
+  --color-cat-custom: var(--cat-custom);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--primary);
+  --color-sidebar-primary-foreground: var(--primary-foreground);
+  --color-sidebar-accent: var(--surface-2);
+  --color-sidebar-accent-foreground: var(--foreground);
+  --color-sidebar-border: var(--border);
+  --color-sidebar-ring: var(--ring);
+}
+
+:root {
+  --radius: 4px;
+
+  --background: oklch(0.165 0.013 240); /* #0a0e13 */
+  --surface: oklch(0.19 0.014 240); /* #0d1117 */
+  --surface-2: oklch(0.225 0.013 240); /* #161b22 */
+  --border: oklch(0.285 0.018 240); /* #1e2a38 */
+  --input: oklch(0.19 0.014 240);
+  --ring: oklch(0.7 0.16 55);
+
+  --foreground: oklch(0.93 0.012 250); /* #e2e8f0 */
+  --muted: oklch(0.225 0.013 240);
+  --muted-foreground: oklch(0.7 0.025 250); /* #94a3b8 */
+  --meta: oklch(0.52 0.02 250); /* #4a5568 */
+
+  --card: oklch(0.19 0.014 240);
+  --card-foreground: oklch(0.93 0.012 250);
+  --popover: oklch(0.19 0.014 240);
+  --popover-foreground: oklch(0.93 0.012 250);
+
+  --primary: oklch(0.69 0.17 55); /* #e67e22 amber */
+  --primary-foreground: oklch(0.98 0 0);
+  --primary-hover: oklch(0.62 0.18 50); /* #d35400 */
+
+  --secondary: oklch(0.225 0.013 240);
+  --secondary-foreground: oklch(0.93 0.012 250);
+
+  --accent: oklch(0.69 0.17 55);
+  --accent-foreground: oklch(0.98 0 0);
+
+  --success: oklch(0.66 0.16 150); /* #27ae60 */
+  --warning: oklch(0.78 0.15 80); /* #f6a623 */
+  --danger: oklch(0.62 0.22 25); /* #e53e3e */
+  --info: oklch(0.6 0.1 200); /* #1294a9 QIE teal */
+
+  --code: oklch(0.83 0.1 235); /* #7dd3fc */
+  --code-string: oklch(0.85 0.16 150); /* #86efac */
+  --code-number: oklch(0.78 0.13 20); /* #fca5a5 */
+  --code-comment: oklch(0.52 0.02 250);
+
+  --cat-token: oklch(0.7 0.1 195);
+  --cat-defi: oklch(0.78 0.15 70);
+  --cat-gov: oklch(0.7 0.16 295);
+  --cat-util: oklch(0.7 0.02 250);
+  --cat-nft: oklch(0.75 0.18 350);
+  --cat-custom: oklch(0.7 0.15 240);
+
+  --sidebar: oklch(0.19 0.014 240);
+  --sidebar-foreground: oklch(0.93 0.012 250);
+
+  color-scheme: dark;
+}
+
+.dark {
+  /* dark is the default (tokens live in :root) */
+}
+
+/*
+ * Light theme: a soft, low-glare white (in the spirit of Etherscan's light
+ * mode): off-white page, white cards, slate text, light borders. Applied by
+ * toggling `light` on <html> (see src/lib/theme.ts).
+ */
+html.light {
+  color-scheme: light;
+
+  --background: oklch(0.97 0.004 80); /* soft warm off-white page, not stark white */
+  --surface: oklch(0.99 0.003 80); /* near-white cards, softened off pure white */
+  --surface-2: oklch(0.955 0.006 80); /* warm gray panels */
+  --border: oklch(0.89 0.006 80); /* warm light-gray hairline */
+  --input: oklch(0.99 0.003 80);
+  --ring: oklch(0.62 0.18 50);
+
+  --foreground: oklch(0.28 0.02 260); /* slate-800 */
+  --muted: oklch(0.955 0.006 80);
+  --muted-foreground: oklch(0.48 0.02 260); /* slate-500 */
+  --meta: oklch(0.62 0.015 260); /* slate-400 */
+
+  --card: oklch(0.99 0.003 80);
+  --card-foreground: oklch(0.28 0.02 260);
+  --popover: oklch(0.99 0.003 80);
+  --popover-foreground: oklch(0.28 0.02 260);
+
+  --primary: oklch(0.62 0.18 50); /* slightly deeper amber for white bg */
+  --primary-foreground: oklch(0.99 0 0);
+  --primary-hover: oklch(0.56 0.19 48);
+
+  --secondary: oklch(0.945 0.006 80);
+  --secondary-foreground: oklch(0.28 0.02 260);
+
+  --accent: oklch(0.62 0.18 50);
+  --accent-foreground: oklch(0.99 0 0);
+
+  --success: oklch(0.55 0.15 150);
+  --warning: oklch(0.66 0.15 70);
+  --danger: oklch(0.55 0.21 25);
+  --destructive: oklch(0.55 0.21 25);
+  --info: oklch(0.5 0.12 215); /* QIE teal, darkened for contrast */
+
+  --code: oklch(0.45 0.13 235);
+  --code-string: oklch(0.5 0.14 150);
+  --code-number: oklch(0.55 0.18 25);
+  --code-comment: oklch(0.62 0.02 260);
+
+  --cat-token: oklch(0.5 0.1 195);
+  --cat-defi: oklch(0.6 0.15 70);
+  --cat-gov: oklch(0.55 0.16 295);
+  --cat-util: oklch(0.5 0.02 260);
+  --cat-nft: oklch(0.6 0.18 350);
+  --cat-custom: oklch(0.55 0.15 240);
+
+  --sidebar: oklch(0.99 0.003 80);
+  --sidebar-foreground: oklch(0.28 0.02 260);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  html,
+  body,
+  #app {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    min-height: 100%;
+  }
+
+  body {
+    font-feature-settings:
+      "rlig" 1,
+      "calt" 1;
+  }
+
+  ::selection {
+    background-color: color-mix(in oklab, var(--color-primary) 35%, transparent);
+    color: var(--color-foreground);
+  }
+
+  /* Sharper scrollbar */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--color-background);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-border);
+    border-radius: 2px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-meta);
+  }
+}
+
+@utility font-mono {
+  font-family: var(--font-mono);
+}
+
+@utility text-code {
+  color: var(--color-code);
+  font-family: var(--font-mono);
+}
+
+@utility terminal-cursor {
+  display: inline-block;
+  width: 8px;
+  height: 1em;
+  background: var(--color-primary);
+  vertical-align: text-bottom;
+  animation: blink 1s steps(2, start) infinite;
+}
+
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@utility animate-fade-up {
+  animation: fade-up 0.6s ease-out both;
+}
+
+/* The hero stage's timer bar. Its duration is set inline from the same
+   constant that advances the scene, so the bar cannot drift from the wait it
+   is describing. */
+@keyframes stage-progress {
+  from {
+    width: 0%;
+  }
+  to {
+    width: 100%;
+  }
+}
+
+/* Sections and photographs arriving as you reach them. Settles from blur and
+   a little lower, which reads as focus pulling rather than a box sliding. */
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+    filter: blur(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
+  }
+}
+
+@utility animate-reveal {
+  animation: reveal 0.9s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* The hero watermark's mark turns once every couple of minutes: slow enough
+   to be atmosphere rather than something the eye tracks. */
+@keyframes slow-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@utility animate-slow-spin {
+  animation: slow-spin 110s linear infinite;
+}
+
+/* Motion is decoration here: the stage still cycles content, it just stops
+   sliding and wiping for anyone who asked the OS not to. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-up,
+  .animate-reveal,
+  .animate-slow-spin {
+    animation: none;
+    opacity: 1;
+    filter: none;
+    transform: none;
+  }
+}

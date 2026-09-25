@@ -1,0 +1,1115 @@
+// The runner's HTTP API.
+//
+// One job = one throwaway container. Files in, logs and build output back.
+// See README.md for the threat model; the short version is that everything
+// here assumes the code it is given is hostile.
+
+import { createServer } from "node:http";
+import { sandboxEnabled } from "./repo-agent";
+import { readinessProblem, sandboxReadiness } from "../../../src/lib/agent/sandbox-exec";
+import {
+  cancelRepoJob,
+  changeFor,
+  getRepoJob,
+  initRepoStore,
+  startRepoJob,
+  viewOf,
+} from "./repo-agent";
+import { LIMITS, type PhaseName } from "./limits";
+import { packTar, unpackTar } from "./tar";
+import {
+  MAX_QUEUED,
+  RATE_LIMIT_GLOBAL,
+  queueDepth,
+  tokenMatches,
+  withSlot,
+  withinRateLimit,
+} from "./gate";
+import { dashboardPage, loginPage } from "./dashboard";
+import { recordJob } from "./history";
+import { snapshot } from "./stats";
+import {
+  COOKIE_NAME,
+  LOGIN_ATTEMPTS,
+  LOGIN_WINDOW_MS,
+  clearedCookie,
+  createSession,
+  endSession,
+  passwordMatches,
+  readCookie,
+  sessionCookie,
+  validSession,
+} from "./session";
+import { pendingDecisions } from "../../../src/lib/agent/decisions";
+import {
+  answerAgentDecision,
+  cancelAgentJob,
+  getAgentJob,
+  initAgentStores,
+  startAgentJob,
+  type StartAgentInput,
+} from "./agent";
+import {
+  canServe,
+  publishSite,
+  serveFile,
+  siteCounts,
+  sitesFor,
+  slugStatus,
+  suggestSlugs,
+  unpublishSite,
+} from "./publish";
+import { ActivityStore, activityFile } from "./activity";
+import { AccountsStore, accountsFile } from "./accounts";
+import { codeMessage, mailConfigured, sendMail } from "./mail";
+import {
+  cancelWorkspace,
+  createWorkspace,
+  getWorkspace,
+  initWorkspaceStore,
+  parseWorkspaceSource,
+  previewAssets,
+  previewDist,
+  sendWorkspaceMessage,
+  setCollaborator,
+  startWorkspacePreview,
+  workspaceFiles,
+  workspaceMembers,
+  workspaceRole,
+  workspaceView,
+} from "./workspace-agent";
+import { readListingFiles, rpcListingChain, storeListingFiles } from "./listings";
+import { MAX_BUNDLE_BYTES } from "../../../src/lib/marketplace/bundle";
+import {
+  createContainer,
+  destroyContainer,
+  dockerAvailable,
+  jobRuntime,
+  runtimeAvailable,
+  getDir,
+  putFiles,
+  runPhase,
+  type PhaseResult,
+} from "./sandbox";
+
+const PORT = Number(process.env.PORT ?? 8792);
+/** Clones and downloads of marketplace listings. See activity.ts. */
+const activity = new ActivityStore(activityFile());
+/** What each wallet is linked to: one GitHub account, one email. See accounts.ts. */
+const accounts = new AccountsStore(accountsFile());
+const HOST = process.env.RUNNER_HOST ?? "127.0.0.1";
+/** Separate from RUNNER_TOKEN on purpose: see session.ts. Unset means the
+ *  dashboard is off entirely rather than open. */
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD ?? "";
+const TOKEN = process.env.RUNNER_TOKEN ?? "";
+const IMAGE = process.env.RUNNER_IMAGE ?? "devstation-runner:3";
+/** Reads DevStationMarketplace, the only authority on who may download a listing. */
+const listingChain = rpcListingChain();
+const DEFAULT_PHASES: PhaseName[] = ["install", "build"];
+const VALID_PHASES = new Set<PhaseName>(["install", "lint", "typecheck", "build", "test"]);
+
+interface JobBody {
+  files?: Record<string, string>;
+  /** Images, fonts and other files that are not text, as base64. Kept apart
+   *  from `files` so a text file is never mistaken for an encoded one. */
+  binaryFiles?: Record<string, string>;
+  phases?: PhaseName[];
+  /** Directory to return after a successful build. */
+  outDir?: string;
+}
+
+/** Read a JSON body with a ceiling, the same way every other route here does.
+ *  Factored out when a fourth copy of it was about to be written. */
+async function readJsonBody<T>(
+  req: import("node:http").IncomingMessage,
+  limit: number,
+): Promise<{ ok: true; value: T } | { ok: false; status: number; message: string }> {
+  let raw = "";
+  let tooBig = false;
+  req.on("data", (chunk) => {
+    raw += chunk;
+    if (raw.length > limit) {
+      tooBig = true;
+      req.destroy();
+    }
+  });
+  await new Promise((r) => req.on("end", r).on("close", r));
+  if (tooBig) return { ok: false, status: 413, message: "Request too large" };
+  try {
+    return { ok: true, value: JSON.parse(raw) as T };
+  } catch {
+    return { ok: false, status: 400, message: "Malformed JSON" };
+  }
+}
+
+function json(res: import("node:http").ServerResponse, status: number, body: unknown) {
+  const text = JSON.stringify(body);
+  res.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(text),
+  });
+  res.end(text);
+}
+
+function html(res: import("node:http").ServerResponse, status: number, body: string) {
+  res.writeHead(status, {
+    "content-type": "text/html; charset=utf-8",
+    "content-length": Buffer.byteLength(body),
+    // The dashboard is one self-contained document: no external scripts,
+    // styles, frames or fonts. Say so, so a stray injection cannot pull any in.
+    "content-security-policy":
+      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; " +
+      "connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    "referrer-policy": "no-referrer",
+    "x-content-type-options": "nosniff",
+  });
+  res.end(body);
+}
+
+/** Read a bounded request body. Anything longer is truncated rather than
+ *  buffered: a login form is a few dozen bytes. */
+async function readBody(req: import("node:http").IncomingMessage, limit: number): Promise<string> {
+  let out = "";
+  for await (const chunk of req) {
+    out += chunk;
+    if (out.length > limit) break;
+  }
+  return out.slice(0, limit);
+}
+
+/** Per-client key for login rate limiting. Behind Caddy the socket address is
+ *  always the proxy, so the forwarded header is what distinguishes callers;
+ *  only the first hop is used, the rest is caller-controlled. */
+function clientKey(req: import("node:http").IncomingMessage): string {
+  const fwd = req.headers["x-forwarded-for"];
+  const first = (Array.isArray(fwd) ? fwd[0] : fwd)?.split(",")[0]?.trim();
+  return first || req.socket.remoteAddress || "unknown";
+}
+
+/** Paths are attacker-controlled; keep them inside the workspace. */
+function safePath(p: string): boolean {
+  return (
+    !p.startsWith("/") &&
+    !p.includes("..") &&
+    !p.includes("\0") &&
+    p.length < 300 &&
+    /^[A-Za-z0-9_\-./@]+$/.test(p)
+  );
+}
+
+/** Bytes that are not UTF-8 text: a NUL, or a sequence that does not survive
+ *  being decoded and encoded again. */
+function isBinary(content: Buffer): boolean {
+  return content.includes(0) || !Buffer.from(content.toString("utf8"), "utf8").equals(content);
+}
+
+function validate(body: JobBody): string | null {
+  const files = body.files ?? {};
+  const binary = body.binaryFiles ?? {};
+  const names = [...Object.keys(files), ...Object.keys(binary)];
+  if (names.length === 0) return "No files supplied.";
+  if (names.length > LIMITS.maxFiles) return `At most ${LIMITS.maxFiles} files per job.`;
+  let bytes = 0;
+  for (const [p, c] of Object.entries(files)) {
+    if (!safePath(p)) return `Unsafe path: ${p}`;
+    bytes += c.length;
+  }
+  for (const [p, c] of Object.entries(binary)) {
+    if (!safePath(p) || typeof c !== "string") return `Unsafe path: ${p}`;
+    bytes += Math.floor((c.length * 3) / 4);
+  }
+  if (bytes > LIMITS.maxInputBytes) return "Project is too large.";
+  for (const p of body.phases ?? []) {
+    if (!VALID_PHASES.has(p)) return `Unknown phase: ${p}`;
+  }
+  return null;
+}
+
+const server = createServer(async (req, res) => {
+  // No CORS headers at all, deliberately. Only DevStation's server calls this,
+  // server-to-server, where CORS does not apply. Advertising "*" on an endpoint
+  // that runs code invites a browser to try, and the answer is always no.
+  if (req.method === "OPTIONS") return void res.writeHead(405).end();
+
+  // --- Published apps -----------------------------------------------------
+  //
+  // Handled before anything else, and keyed on the Host header: a request for
+  // <name>.devstation.online is a visitor looking at somebody's published app,
+  // never an API call. Nothing below this point is reachable from a published
+  // site's hostname, which is why this returns rather than falls through.
+  const host = String(req.headers.host ?? "");
+  if (canServe(host)) {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      return void res.writeHead(405).end();
+    }
+    const file = serveFile(host, req.url ?? "/");
+    if (!file) return void res.writeHead(404, { "content-type": "text/plain" }).end("Not found");
+    res.writeHead(200, {
+      "content-type": file.contentType,
+      "content-length": String(file.body.length),
+      // User-published content: isolate it from DevStation itself and stop it
+      // being sniffed into something else.
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      "cache-control": "public, max-age=60",
+    });
+    return void res.end(req.method === "HEAD" ? undefined : file.body);
+  }
+
+  // Caddy asks this before requesting a certificate for an unknown host. It is
+  // the only thing stopping anyone who points DNS at this box from making us
+  // request certificates on their behalf, so it answers for real published
+  // sites and nothing else. No auth: Caddy is on this host and cannot present a
+  // bearer token, and the answer reveals only whether a name is taken.
+  if ((req.url ?? "").startsWith("/tls-ask")) {
+    const asked = new URL(req.url ?? "/", "http://localhost").searchParams.get("domain") ?? "";
+    return void res.writeHead(canServe(asked) ? 200 : 403).end();
+  }
+
+  if (req.url === "/health") {
+    return json(res, 200, {
+      ok: true,
+      docker: await dockerAvailable(),
+      image: IMAGE,
+      runtime: jobRuntime(),
+      runtimeAvailable: await runtimeAvailable(),
+      // The agent's own isolation, which is a different question from the build
+      // pipeline's above: it uses its own image and refuses a job it cannot
+      // contain. An operator needs to be able to see that this runner would
+      // turn repo jobs away before somebody reports it as broken.
+      agentSandbox: await (async () => {
+        const enabled = sandboxEnabled();
+        if (!enabled) return { enabled: false, ready: false, why: "DEVSTATION_SANDBOX=off" };
+        const readiness = await sandboxReadiness();
+        const problem = readinessProblem(readiness);
+        return {
+          enabled: true,
+          ready: problem === null,
+          image: readiness.imageName,
+          runtime: readiness.runtimeName,
+          ...(problem ? { why: problem } : {}),
+        };
+      })(),
+      ...queueDepth(),
+    });
+  }
+
+  // ---- Dashboard: a read-only view, gated by its own password ----------
+  //
+  // Everything below this block is the machine-to-machine API. These routes
+  // are for a browser, and they can never reach POST /jobs: a dashboard
+  // session is not a token, and the job route checks only for a token.
+  const path = (req.url ?? "/").split("?")[0];
+  const isDashRoute =
+    path === "/" || path === "/login" || path === "/logout" || path === "/api/stats";
+
+  if (isDashRoute) {
+    if (!DASHBOARD_PASSWORD) {
+      // Off, not open. A dashboard with no password would be a public window
+      // into the machine.
+      return html(res, 404, "Not found");
+    }
+    const signedIn = validSession(readCookie(req.headers.cookie, COOKIE_NAME));
+
+    if (path === "/login" && req.method === "POST") {
+      const ip = clientKey(req);
+      if (!withinRateLimit(`login:${ip}`, LOGIN_ATTEMPTS, LOGIN_WINDOW_MS)) {
+        return html(res, 429, loginPage("Too many attempts. Wait a few minutes."));
+      }
+      const body = await readBody(req, 4096);
+      const given = new URLSearchParams(body).get("password") ?? "";
+      if (!passwordMatches(given, DASHBOARD_PASSWORD)) {
+        return html(res, 401, loginPage("That password is not right."));
+      }
+      res.writeHead(303, { location: "/", "set-cookie": sessionCookie(createSession()) });
+      return void res.end();
+    }
+
+    if (path === "/logout" && req.method === "POST") {
+      endSession(readCookie(req.headers.cookie, COOKIE_NAME));
+      res.writeHead(303, { location: "/login", "set-cookie": clearedCookie() });
+      return void res.end();
+    }
+
+    if (path === "/login") return html(res, 200, loginPage());
+
+    if (!signedIn) {
+      if (path === "/api/stats") return json(res, 401, { ok: false, message: "Sign in" });
+      res.writeHead(303, { location: "/login" });
+      return void res.end();
+    }
+
+    if (path === "/api/stats") {
+      return json(
+        res,
+        200,
+        await snapshot({
+          image: IMAGE,
+          runtime: jobRuntime(),
+          runtimeAvailable: await runtimeAvailable(),
+          docker: await dockerAvailable(),
+        }),
+      );
+    }
+    return html(res, 200, dashboardPage());
+  }
+
+  // --- App Builder turns -------------------------------------------------
+  //
+  // These outlive the page that started them, which is the entire point: the
+  // browser holds an id, not a connection, so a refresh reattaches instead of
+  // losing the build. Same bearer token as /jobs: starting a turn runs code.
+  // --- Marketplace files ---------------------------------------------------
+  //
+  // PUT stores a listing's files for its creator; GET releases them to a wallet
+  // the chain says has access. The wallet comes from DevStation's server, which
+  // verified it with a signature; the bearer token is what makes that header
+  // trustworthy, exactly as for /publish.
+  const listingRoute = /^\/listings\/(\d{1,10})\/(\d{1,9})$/.exec(path);
+  if (listingRoute) {
+    if (!tokenMatches(req.headers.authorization, TOKEN)) {
+      return json(res, 401, { ok: false, message: "Unauthorized" });
+    }
+    const chainId = Number(listingRoute[1]);
+    const id = Number(listingRoute[2]);
+    const wallet = String(req.headers["x-devstation-owner"] ?? "").slice(0, 100);
+
+    if (req.method === "GET") {
+      const result = await readListingFiles({ chain: listingChain, chainId, id, wallet });
+      return json(res, result.status, result.body);
+    }
+
+    if (req.method === "PUT") {
+      const caller =
+        String(req.headers["x-devstation-caller"] ?? "").slice(0, 100) || clientKey(req);
+      if (!withinRateLimit(`listing:${caller}`)) {
+        return json(res, 429, { ok: false, message: "Too many uploads from this client." });
+      }
+      let raw = "";
+      let tooBig = false;
+      req.on("data", (chunk) => {
+        raw += chunk;
+        // A bundle may be up to MAX_BUNDLE_BYTES of text; JSON escaping can grow it.
+        if (raw.length > MAX_BUNDLE_BYTES * 2) {
+          tooBig = true;
+          req.destroy();
+        }
+      });
+      await new Promise((r) => req.on("end", r).on("close", r));
+      if (tooBig) return json(res, 413, { ok: false, message: "Request too large" });
+      let body: { files?: unknown };
+      try {
+        body = JSON.parse(raw || "{}") as typeof body;
+      } catch {
+        return json(res, 400, { ok: false, message: "Malformed JSON" });
+      }
+      const result = await storeListingFiles({
+        chain: listingChain,
+        chainId,
+        id,
+        owner: wallet,
+        files: body.files,
+      });
+      return json(res, result.status, result.body);
+    }
+
+    return json(res, 405, { ok: false, message: "Method not allowed" });
+  }
+
+  // --- Marketplace activity and published-app counts ---------------------
+  //
+  // Clones and downloads leave nothing on chain, so they are counted here; how
+  // many apps each wallet has published is known only here. DevStation's server
+  // reads both for the marketplace and the leaderboard. The caller header names
+  // the person for the once-a-day rule, and the bearer token is what makes it
+  // trustworthy.
+  if (path === "/marketplace/activity") {
+    if (!tokenMatches(req.headers.authorization, TOKEN)) {
+      return json(res, 401, { ok: false, message: "Unauthorized" });
+    }
+    if (req.method === "GET") return json(res, 200, { ok: true, counts: activity.all() });
+    if (req.method === "POST") {
+      const caller =
+        String(req.headers["x-devstation-caller"] ?? "").slice(0, 100) || clientKey(req);
+      if (!withinRateLimit(`activity:${caller}`, 240)) {
+        return json(res, 429, { ok: false, message: "Too many requests from this client." });
+      }
+      const body = await readJsonBody<{ listing?: unknown; action?: unknown; wallet?: unknown }>(
+        req,
+        4_000,
+      );
+      if (!body.ok) return json(res, body.status, { ok: false, message: body.message });
+      const wallet =
+        typeof body.value.wallet === "string" && /^0x[a-fA-F0-9]{40}$/.test(body.value.wallet)
+          ? body.value.wallet
+          : "";
+      const counted = activity.record(
+        String(body.value.listing ?? ""),
+        String(body.value.action ?? ""),
+        wallet || caller,
+      );
+      if (counted === null) {
+        return json(res, 400, { ok: false, message: "Unknown listing or action." });
+      }
+      return json(res, 200, { ok: true, counted });
+    }
+    return json(res, 405, { ok: false, message: "Method not allowed" });
+  }
+
+  if (path === "/published-counts") {
+    if (!tokenMatches(req.headers.authorization, TOKEN)) {
+      return json(res, 401, { ok: false, message: "Unauthorized" });
+    }
+    if (req.method !== "GET") return json(res, 405, { ok: false, message: "Method not allowed" });
+    return json(res, 200, { ok: true, counts: siteCounts() });
+  }
+
+  // --- Publish API --------------------------------------------------------
+  //
+  // Same bearer token as the rest: writing a site is a privileged operation,
+  // and the owning wallet comes from DevStation's server, which has verified it.
+  // What a wallet is linked to: one GitHub account, one verified email.
+  //
+  // The wallet is the owner header, set by DevStation's server from the signed
+  // claim; a browser cannot name a wallet here. See accounts.ts for why the
+  // link is one-to-one in both directions.
+  if (path === "/account" || path.startsWith("/account/")) {
+    if (!tokenMatches(req.headers.authorization, TOKEN)) {
+      return json(res, 401, { ok: false, message: "Unauthorized" });
+    }
+    const owner = String(req.headers["x-devstation-owner"] ?? "").slice(0, 100);
+    if (!/^0x[a-fA-F0-9]{40}$/.test(owner)) {
+      return json(res, 400, { ok: false, message: "A wallet address is required." });
+    }
+    const caller = String(req.headers["x-devstation-caller"] ?? "").slice(0, 100) || clientKey(req);
+    if (!withinRateLimit(`account:${caller}`, 120)) {
+      return json(res, 429, { ok: false, message: "Too many requests from this client." });
+    }
+    const rest = path.slice("/account".length).replace(/^\//, "");
+
+    if (!rest && req.method === "GET") {
+      return json(res, 200, {
+        ok: true,
+        account: accounts.view(owner),
+        mailConfigured: mailConfigured(),
+      });
+    }
+
+    if (rest === "github" && req.method === "POST") {
+      const body = await readJsonBody<{ id?: unknown; login?: unknown }>(req, 2_000);
+      if (!body.ok) return json(res, body.status, { ok: false, message: body.message });
+      const linked = accounts.linkGithub(owner, {
+        id: Number(body.value.id),
+        login: String(body.value.login ?? "").slice(0, 100),
+      });
+      if (!linked.ok) {
+        return json(res, linked.error === "bad_request" ? 400 : 409, {
+          ok: false,
+          error: linked.error,
+          message: linked.message,
+        });
+      }
+      return json(res, 200, { ok: true, account: linked.view });
+    }
+
+    if (rest === "github" && req.method === "DELETE") {
+      return json(res, 200, { ok: true, account: accounts.unlinkGithub(owner) });
+    }
+
+    if (rest === "email/start" && req.method === "POST") {
+      const body = await readJsonBody<{ email?: unknown }>(req, 2_000);
+      if (!body.ok) return json(res, body.status, { ok: false, message: body.message });
+      const started = accounts.startEmail(owner, String(body.value.email ?? ""));
+      if (!started.ok) {
+        return json(res, started.error === "cooldown" ? 429 : 400, {
+          ok: false,
+          error: started.error,
+          message: started.message,
+          retryIn: started.retryIn,
+        });
+      }
+      const { subject, text, html } = codeMessage(started.code);
+      const sent = await sendMail({ to: started.address, subject, text, html });
+      if (!sent.ok) {
+        // Nothing arrived, so nothing is pending: the person can try again at
+        // once rather than waiting out a cooldown for a code they never got.
+        accounts.cancelEmail(owner);
+        return json(res, sent.reason === "not_configured" ? 503 : 502, {
+          ok: false,
+          error: sent.reason,
+          message: sent.message,
+        });
+      }
+      return json(res, 200, { ok: true, account: accounts.view(owner) });
+    }
+
+    if (rest === "email/verify" && req.method === "POST") {
+      const body = await readJsonBody<{ code?: unknown }>(req, 2_000);
+      if (!body.ok) return json(res, body.status, { ok: false, message: body.message });
+      const done = accounts.verifyEmail(owner, String(body.value.code ?? ""));
+      if (!done.ok) {
+        return json(res, 400, {
+          ok: false,
+          error: done.error,
+          message: done.message,
+          left: done.left,
+        });
+      }
+      return json(res, 200, { ok: true, account: done.view });
+    }
+
+    if (rest === "email" && req.method === "DELETE") {
+      return json(res, 200, { ok: true, account: accounts.unlinkEmail(owner) });
+    }
+
+    return json(res, 404, { ok: false, message: "Not found" });
+  }
+
+  if (path.startsWith("/publish")) {
+    if (!tokenMatches(req.headers.authorization, TOKEN)) {
+      return json(res, 401, { ok: false, message: "Unauthorized" });
+    }
+    const owner = String(req.headers["x-devstation-owner"] ?? "").slice(0, 100);
+
+    // Is an address free? Asked before anything is uploaded, so a name clash is
+    // something the person sees and fixes rather than something they run into.
+    // A wallet is optional here: without one the answer never says "yours".
+    const wanted = new URL(req.url ?? "/", "http://runner.local").searchParams.get("slug");
+    if (req.method === "GET" && wanted !== null) {
+      const status = slugStatus(wanted, owner);
+      const settled = status.state === "free" || status.state === "yours";
+      return json(res, 200, {
+        ok: true,
+        ...status,
+        suggestions: settled ? [] : suggestSlugs(wanted, owner),
+      });
+    }
+
+    if (!/^0x[a-fA-F0-9]{40}$/.test(owner)) {
+      return json(res, 400, { ok: false, message: "A wallet address is required to publish." });
+    }
+
+    if (req.method === "GET") {
+      return json(res, 200, { ok: true, sites: sitesFor(owner) });
+    }
+
+    if (req.method === "POST" || req.method === "DELETE") {
+      let raw = "";
+      let tooBig = false;
+      req.on("data", (chunk) => {
+        raw += chunk;
+        if (raw.length > LIMITS.maxInputBytes * 2) {
+          tooBig = true;
+          req.destroy();
+        }
+      });
+      await new Promise((r) => req.on("end", r).on("close", r));
+      if (tooBig) return json(res, 413, { ok: false, message: "Request too large" });
+      let body: { slug?: string; files?: Record<string, string>; fallback?: boolean };
+      try {
+        body = JSON.parse(raw || "{}") as typeof body;
+      } catch {
+        return json(res, 400, { ok: false, message: "Malformed JSON" });
+      }
+      if (req.method === "DELETE") {
+        const gone = unpublishSite(String(body.slug ?? ""), owner);
+        return json(res, gone ? 200 : 404, { ok: gone });
+      }
+      const caller =
+        String(req.headers["x-devstation-caller"] ?? "").slice(0, 100) || clientKey(req);
+      if (!withinRateLimit(`publish:${caller}`)) {
+        return json(res, 429, { ok: false, message: "Too many publishes from this client." });
+      }
+      const result = publishSite({
+        slug: String(body.slug ?? ""),
+        files: body.files ?? {},
+        owner,
+        fallback: body.fallback === true,
+      });
+      return json(res, result.ok ? 200 : 400, result);
+    }
+    return json(res, 405, { ok: false, message: "Method not allowed" });
+  }
+
+  if (path.startsWith("/agent/jobs")) {
+    if (!tokenMatches(req.headers.authorization, TOKEN)) {
+      return json(res, 401, { ok: false, message: "Unauthorized" });
+    }
+    const rest = path.slice("/agent/jobs".length).replace(/^\//, "");
+
+    if (!rest && req.method === "POST") {
+      const caller =
+        String(req.headers["x-devstation-caller"] ?? "").slice(0, 100) || clientKey(req);
+      if (!withinRateLimit(`agent:${caller}`)) {
+        return json(res, 429, { ok: false, message: "Too many builds from this client." });
+      }
+      let raw = "";
+      let tooBig = false;
+      req.on("data", (chunk) => {
+        raw += chunk;
+        if (raw.length > LIMITS.maxInputBytes * 2) {
+          tooBig = true;
+          req.destroy();
+        }
+      });
+      await new Promise((r) => req.on("end", r).on("close", r));
+      if (tooBig) return json(res, 413, { ok: false, message: "Request too large" });
+      let body: StartAgentInput & { files?: Record<string, string> };
+      try {
+        body = JSON.parse(raw) as StartAgentInput;
+      } catch {
+        return json(res, 400, { ok: false, message: "Malformed JSON" });
+      }
+      if (typeof body?.prompt !== "string" || !body.prompt.trim()) {
+        return json(res, 400, { ok: false, message: "A prompt is required." });
+      }
+      if (typeof body?.projectId !== "string" || !body.projectId) {
+        return json(res, 400, { ok: false, message: "A projectId is required." });
+      }
+      const job = startAgentJob({
+        projectId: body.projectId,
+        prompt: body.prompt,
+        files: body.files ?? {},
+        history: Array.isArray(body.history) ? body.history : [],
+        context: body.context,
+        dir: body.dir,
+        // Passed through, NOT defaulted to "build". runTurn only classifies
+        // when the mode is unset, so forcing one here bypassed the intent
+        // layer entirely: "hello" reached the build pipeline and wrote files.
+        mode: body.mode === "review" || body.mode === "build" ? body.mode : undefined,
+        // Same header the publish route trusts: DevStation's server has already
+        // verified the wallet. Only accepted in the address shape it must have,
+        // and left empty otherwise rather than carrying through whatever the
+        // caller wrote.
+        owner: (() => {
+          const owner = String(req.headers["x-devstation-owner"] ?? "").slice(0, 100);
+          return /^0x[a-fA-F0-9]{40}$/.test(owner) ? owner : "";
+        })(),
+      });
+      return json(res, 200, { ok: true, id: job.id, phase: job.phase, status: job.status });
+    }
+
+    // Answering the question a paused task is waiting on. Everything it needs
+    // is on disk, so this works even in a process that never saw the question
+    // asked, which is the whole point of the phase.
+    if (rest.endsWith("/decision") && req.method === "POST") {
+      const jobId = rest.replace(/\/decision$/, "");
+      let raw = "";
+      let tooBig = false;
+      req.on("data", (chunk) => {
+        raw += chunk;
+        if (raw.length > 64_000) {
+          tooBig = true;
+          req.destroy();
+        }
+      });
+      await new Promise((r) => req.on("end", r).on("close", r));
+      if (tooBig) return json(res, 413, { ok: false, message: "Request too large" });
+      let body: {
+        requestId?: unknown;
+        clientRequestId?: unknown;
+        selectedOptionIds?: unknown;
+        text?: unknown;
+      };
+      try {
+        body = JSON.parse(raw) as typeof body;
+      } catch {
+        return json(res, 400, { ok: false, message: "Malformed JSON" });
+      }
+      if (typeof body.requestId !== "string" || !body.requestId) {
+        return json(res, 400, { ok: false, message: "A requestId is required." });
+      }
+      // Without this the same click landing twice would run the action twice.
+      if (typeof body.clientRequestId !== "string" || !body.clientRequestId) {
+        return json(res, 400, { ok: false, message: "A clientRequestId is required." });
+      }
+      const result = answerAgentDecision({
+        jobId,
+        requestId: body.requestId,
+        clientRequestId: body.clientRequestId,
+        selectedOptionIds: Array.isArray(body.selectedOptionIds)
+          ? body.selectedOptionIds.filter((v): v is string => typeof v === "string")
+          : undefined,
+        text: typeof body.text === "string" ? body.text : undefined,
+      });
+      return json(res, result.ok ? 200 : 400, result);
+    }
+
+    if (rest.endsWith("/cancel") && req.method === "POST") {
+      const cancelled = cancelAgentJob(rest.replace(/\/cancel$/, ""));
+      return json(res, cancelled ? 200 : 404, { ok: cancelled });
+    }
+
+    if (rest && req.method === "GET") {
+      const job = getAgentJob(rest);
+      if (!job) return json(res, 404, { ok: false, message: "No such job." });
+      // The question travels with the job, so one poll carries everything the
+      // browser needs. It also cannot hand back a question that has already
+      // lapsed: pendingDecisions decides expiry on read, and getAgentJob has
+      // just moved the job on if it had.
+      const decision =
+        job.phase === "awaiting_decision" && job.pendingDecisionId
+          ? (pendingDecisions(job.id).find((d) => d.id === job.pendingDecisionId) ?? null)
+          : null;
+      return json(res, 200, { ok: true, job, decision });
+    }
+
+    return json(res, 404, { ok: false, message: "Not found" });
+  }
+
+  // The Coding Agent in the browser: a conversation over a workspace that
+  // persists between messages. See workspace-agent.ts.
+  if (path.startsWith("/agent/workspaces")) {
+    if (!tokenMatches(req.headers.authorization, TOKEN)) {
+      return json(res, 401, { ok: false, message: "Unauthorized" });
+    }
+    const [id, action] = path.slice("/agent/workspaces".length).replace(/^\//, "").split("/");
+    const caller = String(req.headers["x-devstation-caller"] ?? "").slice(0, 100) || clientKey(req);
+
+    if (!id && req.method === "POST") {
+      if (!withinRateLimit(`workspace:${caller}`)) {
+        return json(res, 429, { ok: false, message: "Too many workspaces from this client." });
+      }
+      const body = await readJsonBody<{ source?: unknown }>(req, 14_000_000);
+      if (!body.ok) return json(res, body.status, { ok: false, message: body.message });
+      const parsed = parseWorkspaceSource(body.value.source);
+      if ("error" in parsed) return json(res, 400, { ok: false, message: parsed.error });
+      const created = await createWorkspace({
+        owner: String(req.headers["x-devstation-owner"] ?? "").slice(0, 100),
+        source: parsed.source,
+        files: parsed.files,
+      });
+      if (!created.ok) return json(res, 400, { ok: false, message: created.message });
+      return json(res, 200, { ok: true, workspace: workspaceView(created.session) });
+    }
+
+    if (id && action === "messages" && req.method === "POST") {
+      // The owner or a builder they added. A missing workspace still answers
+      // 404 below, which is what tells the site to recreate it.
+      const sender = String(req.headers["x-devstation-owner"] ?? "").slice(0, 100);
+      if (getWorkspace(id) && !workspaceRole(id, sender)) {
+        return json(res, 403, {
+          ok: false,
+          message:
+            "This workspace belongs to another wallet. Switch back to it, or ask its owner to add this one.",
+        });
+      }
+      if (!withinRateLimit(`workspace-message:${caller}`)) {
+        return json(res, 429, { ok: false, message: "Too many messages from this client." });
+      }
+      const body = await readJsonBody<{ prompt?: unknown; context?: unknown }>(req, 100_000);
+      if (!body.ok) return json(res, body.status, { ok: false, message: body.message });
+      const sent = sendWorkspaceMessage(
+        id,
+        typeof body.value.prompt === "string" ? body.value.prompt : "",
+        { context: typeof body.value.context === "string" ? body.value.context : undefined },
+      );
+      if (!sent.ok) return json(res, sent.status, { ok: false, message: sent.message });
+      return json(res, 200, { ok: true, workspace: workspaceView(sent.session) });
+    }
+
+    if (id && action === "cancel" && req.method === "POST") {
+      const cancelled = cancelWorkspace(id);
+      return json(res, cancelled ? 200 : 404, { ok: cancelled });
+    }
+
+    if (id && action === "preview" && req.method === "POST") {
+      const started = startWorkspacePreview(id);
+      if (!started.ok) return json(res, started.status, { ok: false, message: started.message });
+      return json(res, 200, { ok: true, workspace: workspaceView(started.session) });
+    }
+
+    if (id && action === "preview" && req.method === "GET") {
+      const dist = previewDist(id);
+      if (!dist) return json(res, 404, { ok: false, message: "No preview has been built." });
+      // Images and fonts travel beside the text, as base64.
+      return json(res, 200, { ok: true, dist, assets: previewAssets(id) });
+    }
+
+    // Who builds on a workspace. The wallet asking comes in the owner header,
+    // set by DevStation's server from the signed claim, never by the browser.
+    if (id && action === "members") {
+      const wallet = String(req.headers["x-devstation-owner"] ?? "").slice(0, 100);
+      const members = workspaceMembers(id);
+      if (!members) return json(res, 404, { ok: false, message: "That workspace is gone." });
+      if (req.method === "GET") {
+        return json(res, 200, { ok: true, role: workspaceRole(id, wallet), ...members });
+      }
+      if (req.method === "POST") {
+        const body = await readJsonBody<{ wallet?: unknown; remove?: unknown }>(req, 2_000);
+        if (!body.ok) return json(res, body.status, { ok: false, message: body.message });
+        const changed = setCollaborator(
+          id,
+          wallet,
+          String(body.value.wallet ?? ""),
+          body.value.remove !== true,
+        );
+        if (!changed.ok) return json(res, changed.status, { ok: false, message: changed.message });
+        return json(res, 200, {
+          ok: true,
+          role: "owner",
+          owner: members.owner,
+          collaborators: changed.collaborators,
+        });
+      }
+      return json(res, 405, { ok: false, message: "Method not allowed" });
+    }
+
+    if (id && action === "files" && req.method === "GET") {
+      const files = workspaceFiles(id);
+      if (!files) return json(res, 404, { ok: false, message: "That workspace is gone." });
+      return json(res, 200, { ok: true, files });
+    }
+
+    if (id && !action && req.method === "GET") {
+      const session = getWorkspace(id);
+      if (!session) return json(res, 404, { ok: false, message: "That workspace is gone." });
+      return json(res, 200, { ok: true, workspace: workspaceView(session) });
+    }
+
+    return json(res, 404, { ok: false, message: "Not found" });
+  }
+
+  // Agent runs against a repository somebody already has. Separate from
+  // /agent/jobs: that one builds an app from a prompt, this one changes a
+  // project that exists. No GitHub credential reaches this process for either.
+  if (path.startsWith("/agent/repo-jobs")) {
+    if (!tokenMatches(req.headers.authorization, TOKEN)) {
+      return json(res, 401, { ok: false, message: "Unauthorized" });
+    }
+    const rest = path.slice("/agent/repo-jobs".length).replace(/^\//, "");
+
+    if (!rest && req.method === "POST") {
+      const caller =
+        String(req.headers["x-devstation-caller"] ?? "").slice(0, 100) || clientKey(req);
+      if (!withinRateLimit(`repo:${caller}`)) {
+        return json(res, 429, { ok: false, message: "Too many runs from this client." });
+      }
+      const body = await readJsonBody<{
+        repo?: unknown;
+        ref?: unknown;
+        goal?: unknown;
+        files?: unknown;
+      }>(req, LIMITS.maxInputBytes * 2);
+      if (!body.ok) return json(res, body.status, { ok: false, message: body.message });
+
+      const { repo, ref, goal, files } = body.value;
+      if (typeof repo !== "string" || !repo.trim()) {
+        return json(res, 400, { ok: false, message: "A repository is required." });
+      }
+      if (typeof goal !== "string" || !goal.trim()) {
+        return json(res, 400, { ok: false, message: "A goal is required." });
+      }
+      if (!files || typeof files !== "object" || Array.isArray(files)) {
+        return json(res, 400, { ok: false, message: "The repository files are required." });
+      }
+      const job = startRepoJob({
+        repo: repo.slice(0, 200),
+        ref: typeof ref === "string" && ref ? ref.slice(0, 200) : "main",
+        goal: goal.slice(0, 4000),
+        files: files as Record<string, string>,
+      });
+      return json(res, 200, { ok: true, job: viewOf(job) });
+    }
+
+    if (rest.endsWith("/cancel") && req.method === "POST") {
+      const cancelled = cancelRepoJob(rest.replace(/\/cancel$/, ""));
+      return json(res, cancelled ? 200 : 404, { ok: cancelled });
+    }
+
+    // The change itself, for the app's server alone. It holds the person's
+    // session and is about to ask them whether to open the pull request; the
+    // browser never needs the file contents and is never sent them.
+    if (rest.endsWith("/change") && req.method === "GET") {
+      const change = changeFor(rest.replace(/\/change$/, ""));
+      if (!change) return json(res, 404, { ok: false, message: "No finished run with that id." });
+      return json(res, 200, { ok: true, ...change });
+    }
+
+    if (rest && req.method === "GET") {
+      const job = getRepoJob(rest);
+      if (!job) return json(res, 404, { ok: false, message: "No such run." });
+      return json(res, 200, { ok: true, job: viewOf(job) });
+    }
+
+    return json(res, 404, { ok: false, message: "Not found" });
+  }
+
+  if (path !== "/jobs" || req.method !== "POST") {
+    return json(res, 404, { ok: false, message: "Not found" });
+  }
+  if (!tokenMatches(req.headers.authorization, TOKEN)) {
+    return json(res, 401, { ok: false, message: "Unauthorized" });
+  }
+  // Per caller, not one global bucket. Keying every build under the literal
+  // string "token" meant all of DevStation shared a single 30/hour budget, so
+  // one busy user, or one abuser, starved everybody else. The caller is
+  // identified by the header DevStation's proxy sets; the shared key remains as
+  // a ceiling so the host itself cannot be swamped by many distinct callers.
+  const caller = String(req.headers["x-devstation-caller"] ?? "").slice(0, 100) || clientKey(req);
+  if (!withinRateLimit(`caller:${caller}`)) {
+    return json(res, 429, { ok: false, message: "Too many builds from this client." });
+  }
+  if (!withinRateLimit("all", RATE_LIMIT_GLOBAL)) {
+    return json(res, 429, { ok: false, message: "The build service is at capacity." });
+  }
+
+  let raw = "";
+  let tooBig = false;
+  req.on("data", (chunk) => {
+    raw += chunk;
+    if (raw.length > LIMITS.maxInputBytes * 2) {
+      tooBig = true;
+      req.destroy();
+    }
+  });
+  await new Promise((r) => req.on("end", r).on("close", r));
+  if (tooBig) return json(res, 413, { ok: false, message: "Request too large" });
+
+  let body: JobBody;
+  try {
+    body = JSON.parse(raw) as JobBody;
+  } catch {
+    return json(res, 400, { ok: false, message: "Malformed JSON" });
+  }
+  const problem = validate(body);
+  if (problem) return json(res, 400, { ok: false, message: problem });
+
+  const phases = body.phases?.length ? body.phases : DEFAULT_PHASES;
+  const name = `devstation-job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const results: PhaseResult[] = [];
+
+  // One job at a time. A build is a whole CPU and up to a gigabyte, and this
+  // host has neither to spare twice over. Anything past the queue is turned
+  // away now rather than holding a connection open for minutes.
+  const outcome = await withSlot(async () => {
+    // The clock starts when the job does, not when it was accepted: time spent
+    // queueing is not the job's fault and should not eat its deadline.
+    const startedAt = Date.now();
+    const deadline = startedAt + LIMITS.jobTimeoutMs;
+    let failure: string | undefined;
+    let distCount: number | null = null;
+    try {
+      await createContainer(IMAGE, name);
+      await putFiles(
+        name,
+        packTar({
+          ...body.files,
+          ...Object.fromEntries(
+            Object.entries(body.binaryFiles ?? {}).map(([p, c]) => [p, Buffer.from(c, "base64")]),
+          ),
+        }),
+      );
+
+      for (const phase of phases) {
+        if (Date.now() > deadline) {
+          results.push({
+            phase,
+            ok: false,
+            exitCode: null,
+            log: "Job timed out before this phase ran.",
+            durationMs: 0,
+            timedOut: true,
+          });
+          break;
+        }
+        const result = await runPhase(name, phase);
+        results.push(result);
+        // Stop at the first failure: later phases would fail for the same
+        // reason and the logs get harder to read, not easier.
+        if (!result.ok) break;
+      }
+
+      let dist: Record<string, string> | null = null;
+      // Built images and fonts, as base64. Read as UTF-8 they were mangled
+      // beyond use; a caller that wants only text ignores this.
+      let distBinary: Record<string, string> | null = null;
+      const built = results.find((r) => r.phase === "build");
+      if (built?.ok) {
+        const outDir = body.outDir ?? "dist";
+        const tar = await getDir(name, outDir);
+        if (tar) {
+          dist = {};
+          for (const entry of unpackTar(tar)) {
+            // The archive names every file under the directory it came from,
+            // which is `build/` for some projects, not always `dist/`.
+            const rel = entry.path.startsWith(`${outDir}/`)
+              ? entry.path.slice(outDir.length + 1)
+              : entry.path;
+            if (!rel || rel.endsWith("/")) continue;
+            if (isBinary(entry.content)) {
+              distBinary ??= {};
+              distBinary[rel] = entry.content.toString("base64");
+            } else {
+              dist[rel] = entry.content.toString("utf8");
+            }
+          }
+        }
+      }
+
+      distCount = dist ? Object.keys(dist).length + Object.keys(distBinary ?? {}).length : null;
+      return {
+        status: 200,
+        body: {
+          ok: results.every((r) => r.ok),
+          phases: results,
+          dist,
+          ...(distBinary ? { distBinary } : {}),
+        },
+      };
+    } catch (e) {
+      failure = e instanceof Error ? e.message : "The job failed to start.";
+      return {
+        status: 500,
+        body: { ok: false, phases: results, message: failure },
+      };
+    } finally {
+      await destroyContainer(name);
+      // Recorded whatever happened, including a job that never got going -
+      // "it did not start" is exactly the kind of thing you want a record of.
+      recordJob({
+        id: name,
+        startedAt,
+        durationMs: Date.now() - startedAt,
+        ok: failure === undefined && results.length > 0 && results.every((r) => r.ok),
+        error: failure,
+        fileCount: Object.keys(body.files ?? {}).length,
+        distFileCount: distCount,
+        phases: results.map((r) => ({
+          phase: r.phase,
+          ok: r.ok,
+          durationMs: r.durationMs,
+          timedOut: r.timedOut,
+          log: r.log,
+        })),
+      });
+    }
+  });
+
+  if (!outcome) {
+    return json(res, 429, {
+      ok: false,
+      message: `The runner is busy: more than ${MAX_QUEUED} jobs are already waiting. Try again shortly.`,
+    });
+  }
+  return json(res, outcome.status, outcome.body);
+});
+
+// Loopback by default, and deliberately.
+//
+// node's listen() with no host binds every interface, which on a VPS with no
+// firewall means this is on the public internet: an endpoint that runs
+// arbitrary code, guarded by one shared bearer token. That is not a default
+// anyone should have to opt out of. Set RUNNER_HOST=0.0.0.0 only behind a
+// reverse proxy that terminates TLS and does its own authentication.
+// Before the first request, so a grant or a question written by the process
+// that just died is read back rather than silently starting empty.
+initAgentStores();
+initRepoStore();
+initWorkspaceStore();
+
+server.listen(PORT, HOST, () => {
+  console.log(
+    `[runner] listening on ${HOST}:${PORT} image=${IMAGE} auth=${TOKEN ? "on" : "MISSING"}`,
+  );
+});

@@ -1,0 +1,500 @@
+import { useState, useMemo, useEffect, useRef } from "react";
+import { Link } from "@tanstack/react-router";
+import { X, Rocket, ExternalLink, Copy, Check } from "lucide-react";
+import {
+  useDeployContract,
+  useWaitForTransactionReceipt,
+  useSwitchChain,
+  usePublicClient,
+} from "wagmi";
+import { useAccount } from "wagmi";
+import { encodeDeployData, type Abi } from "viem";
+import { toast } from "sonner";
+import { useProjectRegistry } from "@/hooks/useProjectRegistry";
+import { useSponsorTopup } from "@/hooks/useSponsorTopup";
+import { ContractInteractor } from "@/components/editor/ContractInteractor";
+import { VerifyCard } from "@/components/deploy/VerifyCard";
+import { NetworkMismatchModal } from "@/components/web3/NetworkMismatchModal";
+import { chainConfig, nativeSymbol } from "@/lib/chains";
+import { chainById } from "@/lib/active-chain";
+import { slugForChainId } from "@/lib/explorer/network";
+import { encodeConstructorArgs } from "@/lib/verify/constructorArgs";
+import { parseArgs as parseAbiArgs } from "@/lib/abiArgParser";
+import { ONCHAIN_WRITE_GAS } from "@/lib/contracts";
+import { paddedTopupCost, isSponsorEligibleChain } from "@/lib/sponsor/pricing";
+import type { TerminalLine } from "@/components/shared/TerminalOutput";
+
+interface ContractInfo {
+  abi: unknown[];
+  bytecode: `0x${string}`;
+  deployedBytecode: `0x${string}`;
+  /** Fully-qualified "File.sol:Name" for source verification. */
+  qualifiedName: string;
+}
+
+interface Props {
+  contracts: Record<string, ContractInfo>;
+  chainId: number;
+  /** solc version used to compile (e.g. "0.8.20"), for source verification. */
+  compilerVersion: string;
+  /** Exact solc standard-JSON the editor compiled, for source verification. */
+  standardJsonInput?: string;
+  onClose: () => void;
+  onLog: (line: TerminalLine) => void;
+}
+
+export function DeployPanel({
+  contracts,
+  chainId,
+  compilerVersion,
+  standardJsonInput,
+  onClose,
+  onLog,
+}: Props) {
+  const names = Object.keys(contracts);
+  const [selected, setSelected] = useState(names[0] ?? "");
+  const contract = contracts[selected];
+  const { address, isConnected, chainId: walletChainId } = useAccount();
+  const { switchChainAsync } = useSwitchChain();
+  const publicClient = usePublicClient({ chainId });
+  const { recordDeployment, onChain } = useProjectRegistry();
+  const { deployContractAsync } = useDeployContract();
+  const onSponsorChain = isSponsorEligibleChain(chainId);
+  const {
+    available: sponsorAvailable,
+    checking: sponsorChecking,
+    ensureFunded,
+  } = useSponsorTopup(chainId);
+  const sponsorEligible = sponsorAvailable && onSponsorChain;
+  const [useSponsor, setUseSponsor] = useState(false);
+  const [txHash, setTxHash] = useState<`0x${string}` | null>(null);
+  const [deploying, setDeploying] = useState(false);
+  const [deployed, setDeployed] = useState<{ addr: `0x${string}` } | null>(null);
+  const [args, setArgs] = useState<Record<string, string>>({});
+  // ABI-encoded constructor args, captured at deploy time for source verification.
+  const [encodedCtorArgs, setEncodedCtorArgs] = useState<`0x${string}` | undefined>(undefined);
+  const [mismatchOpen, setMismatchOpen] = useState(false);
+  const [switching, setSwitching] = useState(false);
+
+  // Selected network (chainId prop) must match the wallet before broadcasting.
+  const walletMismatch = isConnected && walletChainId !== chainId;
+
+  const { data: receipt } = useWaitForTransactionReceipt({
+    hash: txHash as `0x${string}` | undefined,
+  });
+
+  // Parse constructor args from ABI
+  const constructorArgs = useMemo(() => {
+    if (!contract?.abi) return [];
+    const c = contract.abi.find(
+      (item: unknown) =>
+        typeof item === "object" &&
+        item !== null &&
+        (item as Record<string, unknown>).type === "constructor",
+    ) as { inputs?: Array<{ name: string; type: string; internalType?: string }> } | undefined;
+    return c?.inputs ?? [];
+  }, [contract]);
+
+  // Whether this wallet actually needs a top-up for this specific deploy -
+  // null while checking. When it comes back false, the "Gas-free deploy"
+  // option goes inert (see render below): offering sponsorship a wallet
+  // doesn't need is just confusing, and forcing `useSponsor` back to false
+  // means a stale "checked" state from a moment ago can't silently request
+  // an unnecessary top-up. Debounced since `args` changes on every keystroke
+  // in the constructor-arg fields, and this fires a real RPC estimate.
+  const [needsTopup, setNeedsTopup] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!sponsorEligible || !contract || !address || !publicClient) {
+      setNeedsTopup(null);
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      try {
+        const parsed = parseAbiArgs(constructorArgs, args);
+        const data = encodeDeployData({
+          abi: contract.abi as Abi,
+          bytecode: contract.bytecode,
+          args: parsed as unknown[],
+        });
+        const [estimate, gasPrice, balance] = await Promise.all([
+          publicClient.estimateGas({ account: address, data }),
+          publicClient.getGasPrice(),
+          publicClient.getBalance({ address }),
+        ]);
+        if (cancelled) return;
+        const needed = paddedTopupCost(estimate, gasPrice, 2n * ONCHAIN_WRITE_GAS);
+        setNeedsTopup(needed > balance);
+      } catch {
+        // Can't tell: fail open (show the option) rather than hide a
+        // control that might genuinely be needed.
+        if (!cancelled) setNeedsTopup(true);
+      }
+    }, 600);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [sponsorEligible, contract, address, publicClient, args, constructorArgs]);
+
+  useEffect(() => {
+    if (needsTopup !== true) setUseSponsor(false);
+  }, [needsTopup]);
+
+  const handleDeploy = async () => {
+    if (!contract || !address) return;
+    if (walletMismatch) {
+      setMismatchOpen(true);
+      return;
+    }
+    setDeploying(true);
+    const ts = new Date().toLocaleTimeString();
+    const cfg = chainConfig(chainId);
+    try {
+      const parsed = parseAbiArgs(constructorArgs, args);
+      // Remember the encoded args so the post-deploy VerifyCard can pass them
+      // explicitly (more reliable than Blockscout's autodetect).
+      setEncodedCtorArgs(encodeConstructorArgs(contract.abi, parsed));
+
+      // Gas sponsorship tops up THIS wallet with just enough native gas
+      // token to cover the deploy (and the registry write after it): it
+      // never broadcasts anything itself. The deploy below runs exactly like a normal
+      // self-paid deploy either way, so the connected wallet is always the
+      // genuine deployer of record.
+      if (useSponsor && sponsorEligible) {
+        onLog({
+          text: `[${ts}] [Deploy] Requesting a gas top-up from DevStation...`,
+          status: "pending",
+        });
+        const result = await ensureFunded({
+          abi: contract.abi as unknown[],
+          bytecode: contract.bytecode,
+          args: parsed,
+          chainId,
+          requesterAddress: address,
+        });
+        onLog({
+          text: result.toppedUp
+            ? `[${ts}] [Deploy] ✓ Wallet funded (${result.txHash})`
+            : `[${ts}] [Deploy] Wallet already had enough gas: no top-up needed`,
+          status: "success",
+        });
+      }
+
+      onLog({
+        text: `[${ts}] [Deploy] Deploying ${selected} to ${cfg.name}...`,
+        status: "pending",
+      });
+
+      // Pad the deploy's gas limit on chains whose eth_estimateGas lowballs
+      // constructor-heavy CREATE calls (documented for QIE in
+      // src/lib/contracts.ts). Best-effort: if estimation itself fails, fall
+      // through and let the wallet estimate as before rather than blocking
+      // the deploy.
+      let gasLimit: bigint | undefined;
+      if (publicClient && address) {
+        try {
+          const data = encodeDeployData({
+            abi: contract.abi as Abi,
+            bytecode: contract.bytecode,
+            args: parsed as unknown[],
+          });
+          const estimate = await publicClient.estimateGas({ account: address, data });
+          gasLimit = estimate * 4n;
+        } catch {
+          /* fall back to wallet-side estimation */
+        }
+      }
+
+      const hash = await deployContractAsync({
+        abi: contract.abi as [],
+        bytecode: contract.bytecode,
+        args: parsed.length > 0 ? parsed : undefined,
+        gas: gasLimit,
+        chainId,
+      });
+      setTxHash(hash);
+      onLog({ text: `[${ts}] [Deploy] TX submitted: ${hash}`, status: "success" });
+      onLog({ text: `[${ts}] [Deploy] Waiting for confirmation...`, status: "pending" });
+
+      // Wait is handled by useWaitForTransactionReceipt in a parent effect-like way
+      toast.success("Transaction sent");
+    } catch (err) {
+      onLog({
+        text: `[${ts}] [Error] ${err instanceof Error ? err.message : "Deploy failed"}`,
+        status: "error",
+      });
+      toast.error(err instanceof Error ? err.message : "Deploy failed");
+    } finally {
+      setDeploying(false);
+    }
+  };
+
+  // Once the deployment receipt arrives, record it (on-chain registry when
+  // configured, always localStorage) and surface the address.
+  const recordedRef = useRef(false);
+  useEffect(() => {
+    if (!receipt || !txHash || recordedRef.current) return;
+    recordedRef.current = true;
+    const addr = receipt.contractAddress as `0x${string}`;
+    setDeployed({ addr });
+    const ts = new Date().toLocaleTimeString();
+    onLog({ text: `[${ts}] [Deploy] ✓ Confirmed: address: ${addr}`, status: "success" });
+    const cfg = chainConfig(chainId);
+    void recordDeployment({
+      contractAddress: addr,
+      templateId: "custom",
+      projectName: selected,
+      network: cfg.name,
+      txHash,
+      chainId,
+      abi: contract?.abi,
+      standardJsonInput,
+      qualifiedName: contract?.qualifiedName,
+      compilerVersion,
+      constructorArgsEncoded: encodedCtorArgs,
+    })
+      .then(() => {
+        if (onChain) {
+          onLog({ text: `[${ts}] [Deploy] ✓ Recorded in ProjectRegistry`, status: "success" });
+        }
+      })
+      .catch(() => {
+        onLog({
+          text: `[${ts}] [Warning] Saved locally; on-chain registry record failed`,
+          status: "warning",
+        });
+      });
+  }, [
+    receipt,
+    txHash,
+    chainId,
+    selected,
+    contract,
+    recordDeployment,
+    onChain,
+    onLog,
+    standardJsonInput,
+    compilerVersion,
+    encodedCtorArgs,
+  ]);
+
+  const [copied, setCopied] = useState(false);
+
+  return (
+    <div className="fixed inset-y-0 right-0 z-50 w-[400px] max-w-[92vw] border-l border-border bg-surface shadow-lg">
+      <div className="flex h-full flex-col">
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-border px-4 py-3">
+          <h2 className="font-mono text-sm font-bold text-primary">Deploy</h2>
+          <button onClick={onClose} className="text-meta hover:text-foreground">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto space-y-4 p-4">
+          {/* Contract selector */}
+          <div>
+            <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-meta">
+              Contract
+            </div>
+            <select
+              value={selected}
+              onChange={(e) => {
+                setSelected(e.target.value);
+                setArgs({});
+              }}
+              className="w-full rounded border border-border bg-background px-2 py-1.5 font-mono text-xs text-foreground"
+            >
+              {names.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Constructor args */}
+          {constructorArgs.length > 0 ? (
+            <div>
+              <div className="mb-2 font-mono text-[10px] uppercase tracking-wider text-meta">
+                Constructor Arguments
+              </div>
+              {constructorArgs.map((a) => (
+                <div key={a.name} className="mb-2">
+                  <div className="flex items-baseline justify-between font-mono text-[10px]">
+                    <span className="text-foreground">{a.name}</span>
+                    <span className="text-meta">{a.type}</span>
+                  </div>
+                  {a.type === "bool" ? (
+                    <button
+                      onClick={() =>
+                        setArgs((p) => ({
+                          ...p,
+                          [a.name]: p[a.name] === "true" ? "false" : "true",
+                        }))
+                      }
+                      className={`mt-0.5 inline-flex h-5 w-9 items-center rounded-full border border-border ${args[a.name] === "true" ? "bg-primary" : "bg-background"}`}
+                    >
+                      <span
+                        className={`inline-block h-3.5 w-3.5 transform rounded-full bg-foreground transition ${args[a.name] === "true" ? "translate-x-5" : "translate-x-0.5"}`}
+                      />
+                    </button>
+                  ) : (
+                    <input
+                      value={args[a.name] ?? ""}
+                      onChange={(e) => setArgs((p) => ({ ...p, [a.name]: e.target.value }))}
+                      placeholder={a.type === "address" ? "0x..." : ""}
+                      className={`mt-0.5 w-full rounded border bg-background px-2 py-1 font-mono text-[11px] text-foreground placeholder:text-meta ${
+                        a.type === "address" &&
+                        (args[a.name] ?? "").length > 0 &&
+                        !/^0x[a-fA-F0-9]{40}$/.test((args[a.name] ?? "").trim())
+                          ? "border-danger focus:border-danger"
+                          : "border-border"
+                      }`}
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="font-mono text-[11px] text-meta">No constructor arguments</p>
+          )}
+
+          {/* Gas sponsorship (sponsor-eligible mainnets only): inert once
+              the wallet is confirmed to already hold enough native gas
+              token, since offering it then would be a no-op at best and
+              confusing at worst. */}
+          {sponsorEligible ? (
+            needsTopup === false ? (
+              <label className="flex cursor-not-allowed items-center gap-1.5 font-mono text-[11px] text-meta opacity-60">
+                <input
+                  type="checkbox"
+                  checked={false}
+                  disabled
+                  className="h-3.5 w-3.5 rounded border-border"
+                />
+                Gas-free deploy, not needed, your wallet already has enough {nativeSymbol(chainId)}
+              </label>
+            ) : (
+              <label className="flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={useSponsor}
+                  disabled={needsTopup === null}
+                  onChange={(e) => setUseSponsor(e.target.checked)}
+                  className="h-3.5 w-3.5 rounded border-border"
+                />
+                {needsTopup === null
+                  ? "Checking gas requirement…"
+                  : "Gas-free deploy (DevStation tops up your wallet)"}
+              </label>
+            )
+          ) : (
+            onSponsorChain && (
+              <p className="font-mono text-[10px] text-meta">
+                {sponsorChecking
+                  ? "Checking gas sponsorship…"
+                  : "Gas-free deploy isn't available right now: you'll pay gas from your own wallet."}
+              </p>
+            )
+          )}
+
+          {/* Deploy button */}
+          <button
+            onClick={handleDeploy}
+            disabled={deploying || !address}
+            className="flex w-full items-center justify-center gap-2 rounded bg-primary px-3 py-2 font-mono text-xs font-bold text-primary-foreground hover:bg-primary-hover disabled:opacity-40"
+          >
+            <Rocket className="h-3.5 w-3.5" /> {deploying ? "Deploying…" : "Deploy Contract"}
+          </button>
+          {!address && (
+            <p className="text-center font-mono text-[10px] text-meta">
+              Connect a wallet to deploy
+            </p>
+          )}
+
+          {/* Post-deploy */}
+          {deployed && (
+            <div className="space-y-2 rounded border border-success/40 bg-success/5 p-3">
+              <div className="font-mono text-[10px] uppercase tracking-wider text-success">
+                Deployed
+              </div>
+              <div className="break-all font-mono text-[11px] text-foreground">{deployed.addr}</div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => {
+                    navigator.clipboard.writeText(deployed.addr);
+                    setCopied(true);
+                    setTimeout(() => setCopied(false), 1500);
+                  }}
+                  className="flex items-center gap-1 font-mono text-[10px] text-meta hover:text-foreground"
+                >
+                  {copied ? (
+                    <Check className="h-3 w-3 text-success" />
+                  ) : (
+                    <Copy className="h-3 w-3" />
+                  )}{" "}
+                  Copy
+                </button>
+                <Link
+                  to="/explorer/$network/address/$hash"
+                  params={{ network: slugForChainId(chainId), hash: deployed.addr }}
+                  className="flex items-center gap-1 font-mono text-[10px] text-primary hover:underline"
+                >
+                  Explorer <ExternalLink className="h-3 w-3" />
+                </Link>
+              </div>
+            </div>
+          )}
+
+          {/* Auto source-verification (standard-input → handles OZ imports) */}
+          {deployed && (
+            <VerifyCard
+              chainId={chainId}
+              address={deployed.addr}
+              contractName={selected}
+              sourceCode=""
+              compilerVersion={compilerVersion}
+              standardJsonInput={standardJsonInput}
+              qualifiedContractName={contract?.qualifiedName}
+              constructorArgs={encodedCtorArgs}
+            />
+          )}
+
+          {/* Post-deploy contract interaction */}
+          {deployed && contract?.abi && contract.abi.length > 0 && (
+            <div className="border-t border-border pt-3">
+              <div className="mb-2 font-mono text-[10px] uppercase tracking-wider text-meta">
+                Interact
+              </div>
+              <ContractInteractor
+                contractAddress={deployed.addr}
+                abi={contract.abi}
+                chainId={chainId}
+              />
+            </div>
+          )}
+        </div>
+      </div>
+      <NetworkMismatchModal
+        isOpen={mismatchOpen}
+        onClose={() => setMismatchOpen(false)}
+        switching={switching}
+        targetNetwork={chainConfig(chainId).name}
+        walletNetwork={chainById(walletChainId)?.name ?? `Chain ${walletChainId}`}
+        onSwitchNetwork={async () => {
+          setSwitching(true);
+          try {
+            await switchChainAsync({ chainId });
+            setMismatchOpen(false);
+          } catch {
+            /* user rejected; leave modal open */
+          } finally {
+            setSwitching(false);
+          }
+        }}
+      />
+    </div>
+  );
+}

@@ -1,0 +1,46 @@
+{
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "vite.config.ts",
+    "eslint.config.js",
+    // The runner is real, deployed code. Leaving it out of typechecking let a
+    // missing import ship: tsc passed, and the service crashed on every job
+    // POST with "RATE_LIMIT_GLOBAL is not defined".
+    "services/**/*.ts",
+    // Same reasoning as the runner, learned the same way: the benchmark and
+    // the scripts were outside the program, so `tsc --noEmit` passed while
+    // bench/runner/run.ts pushed an object missing a required field.
+    "bench/**/*.ts",
+    "scripts/**/*.ts",
+    "types/**/*.d.ts"
+  ],
+  // The files of marketplace listings are what buyers get, not part of the site:
+  // a skill's hardhat.config.ts imports Hardhat, which the site never installs.
+  "exclude": ["src/lib/data/marketplace/official/*/files/**", "marketplace-content/**"],
+  "compilerOptions": {
+    "target": "ES2022",
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["vite/client", "@types/bun"],
+
+    /* Bundler mode */
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "verbatimModuleSyntax": false,
+    "noEmit": true,
+
+    /* Linting */
+    "skipLibCheck": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true,
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
