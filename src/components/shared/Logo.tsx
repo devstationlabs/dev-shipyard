@@ -1,4 +1,4 @@
-import { Link } from "@tanstack/react-router";
+import { siteHref } from "@/lib/site-hosts";
 import { cn } from "@/lib/utils";
 
 // DevStation brand mark: a terminal prompt chevron + caret inside a rounded
@@ -33,7 +33,7 @@ export function LogoMark({ className }: { className?: string }) {
 export function Logo({ compact = false }: { compact?: boolean }) {
   // Clickable brand: navigates back to the landing page.
   return (
-    <Link to="/" className="flex items-center gap-2" aria-label="DevStation home">
+    <a href={siteHref("/")} className="flex items-center gap-2" aria-label="DevStation home">
       <LogoMark />
       {!compact && (
         <div>
@@ -45,6 +45,6 @@ export function Logo({ compact = false }: { compact?: boolean }) {
           </div>
         </div>
       )}
-    </Link>
+    </a>
   );
 }
