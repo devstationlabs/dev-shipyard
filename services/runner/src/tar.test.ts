@@ -18,7 +18,7 @@ describe("tar", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tar-"));
     const archive = path.join(dir, "a.tar");
     fs.writeFileSync(archive, packTar(files));
-    execFileSync("tar", ["-xf", archive, "-C", dir]);
+    execFileSync("tar", ["--no-same-owner", "-xf", archive, "-C", dir]);
     for (const [name, content] of Object.entries(files)) {
       expect(`${name}: ${fs.readFileSync(path.join(dir, name), "utf8")}`).toBe(
         `${name}: ${content}`,
